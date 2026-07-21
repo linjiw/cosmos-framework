@@ -342,8 +342,8 @@ class OmniMoTModel(ImaginaireModel):
         log.info(f"Loading reasoner pathway weights from {pretrained_weights.backbone_path}")
         _load_language_model(self.net)
         # Keep the EMA copy in sync with the freshly seeded understanding weights.
-        # (CPU-subset EMA mode has no live net_ema; frozen keys mirror net at save.)
-        if self.config.ema.enabled and self.net_ema is not None:
+        # (CPU-subset EMA mode aliases net_ema to net — skip the duplicate load.)
+        if self.config.ema.enabled and self.net_ema is not self.net:
             _load_language_model(self.net_ema)
         log.info("Successfully loaded reasoner pathway weights.")
 
@@ -361,7 +361,7 @@ class OmniMoTModel(ImaginaireModel):
         # (diffusion MoE) experts so generation starts from the pretrained backbone.
         log.info("Copying understanding pathway weights to generation pathway.")
         self.net.language_model.init_moe()
-        if self.config.ema.enabled and self.net_ema is not None:
+        if self.config.ema.enabled and self.net_ema is not self.net:
             self.net_ema.language_model.init_moe()
         log.info("Successfully copied understanding pathway weights to generation pathway.")
 
@@ -386,7 +386,15 @@ class OmniMoTModel(ImaginaireModel):
                     # so the skipped copy_to below is immaterial). Frozen params'
                     # EMA equals their weight by definition; the checkpoint save
                     # path reconstructs full net_ema.* from net + these buffers.
-                    self.net_ema = None
+                    #
+                    # net_ema is ALIASED to net (not None): torch DCP's
+                    # get_model_state_dict validates every state-dict key by
+                    # getattr-walking the module tree, so the `net_ema.` attribute
+                    # path must resolve. The alias contributes no memory and no
+                    # values — our state_dict()/load_state_dict() overrides supply
+                    # the EMA tensors from the CPU buffers. Guards below use
+                    # `is not self.net` to skip stock double-init on the alias.
+                    self.net_ema = self.net
                     self.net_ema_worker = None
                     self._cpu_ema = None
                     log.info("EMA_CPU_SUBSET: skipping full fp32 net_ema clone (lazy CPU subset EMA)")
