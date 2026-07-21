@@ -16,7 +16,7 @@ from einops import rearrange
 from torch.distributed._composable.fsdp import FSDPModule
 from torch.nn.modules.module import _IncompatibleKeys
 
-from cosmos_framework.utils.flags import DEVICE, TRAINING, Device
+from cosmos_framework.utils.flags import DEVICE, EMA_CPU_SUBSET, TRAINING, VAE_CPU_OFFLOAD, Device
 from cosmos_framework.utils.lazy_config import LazyDict
 from cosmos_framework.utils.lazy_config import instantiate as lazy_instantiate
 from cosmos_framework.model._base import ImaginaireModel
@@ -165,6 +165,11 @@ class OmniMoTModel(ImaginaireModel):
         )
         if hasattr(self.tokenizer_vision_gen, "reset_dtype"):
             self.tokenizer_vision_gen.reset_dtype()
+        if VAE_CPU_OFFLOAD:
+            # Park the frozen VAE on CPU; _vae_on_gpu() moves it over per call.
+            self.tokenizer_vision_gen.model.model.to("cpu")
+            torch.cuda.empty_cache()
+            log.info("VAE_CPU_OFFLOAD: vision VAE parked on CPU (moved to GPU per encode/decode call)")
 
         # 3. Sound/audio tokenizer (optional)
         if self.config.sound_gen:
@@ -337,7 +342,8 @@ class OmniMoTModel(ImaginaireModel):
         log.info(f"Loading reasoner pathway weights from {pretrained_weights.backbone_path}")
         _load_language_model(self.net)
         # Keep the EMA copy in sync with the freshly seeded understanding weights.
-        if self.config.ema.enabled:
+        # (CPU-subset EMA mode has no live net_ema; frozen keys mirror net at save.)
+        if self.config.ema.enabled and self.net_ema is not None:
             _load_language_model(self.net_ema)
         log.info("Successfully loaded reasoner pathway weights.")
 
@@ -355,7 +361,7 @@ class OmniMoTModel(ImaginaireModel):
         # (diffusion MoE) experts so generation starts from the pretrained backbone.
         log.info("Copying understanding pathway weights to generation pathway.")
         self.net.language_model.init_moe()
-        if self.config.ema.enabled:
+        if self.config.ema.enabled and self.net_ema is not None:
             self.net_ema.language_model.init_moe()
         log.info("Successfully copied understanding pathway weights to generation pathway.")
 
@@ -370,15 +376,27 @@ class OmniMoTModel(ImaginaireModel):
             self._uses_ema_router_bias: bool = uses_ema_router_bias(self.net)
 
             if config.ema.enabled:
-                self.net_ema = self.build_net(dtype=torch.float32)
-                self.net_ema.requires_grad_(False)
-
-                self.net_ema_worker = DTensorFastEmaModelUpdater()
-
                 s = config.ema.rate
                 self.ema_exp_coefficient = np.roots([1, 7, 16 - s**-2, 12 - s**-2]).real.max()
 
-                self.net_ema_worker.copy_to(src_model=self.net, tgt_model=self.net_ema)
+                if EMA_CPU_SUBSET:
+                    # Memory-constrained mode: no full fp32 GPU clone. A CPU-resident
+                    # EMA over the trainable subset is created lazily at the first
+                    # update (ema_beta(0) == 0.0 makes the first update a full seed,
+                    # so the skipped copy_to below is immaterial). Frozen params'
+                    # EMA equals their weight by definition; the checkpoint save
+                    # path reconstructs full net_ema.* from net + these buffers.
+                    self.net_ema = None
+                    self.net_ema_worker = None
+                    self._cpu_ema = None
+                    log.info("EMA_CPU_SUBSET: skipping full fp32 net_ema clone (lazy CPU subset EMA)")
+                else:
+                    self.net_ema = self.build_net(dtype=torch.float32)
+                    self.net_ema.requires_grad_(False)
+
+                    self.net_ema_worker = DTensorFastEmaModelUpdater()
+
+                    self.net_ema_worker.copy_to(src_model=self.net, tgt_model=self.net_ema)
 
         self.set_up_memory()
 
@@ -540,7 +558,9 @@ class OmniMoTModel(ImaginaireModel):
             # only, so mirror it into net_ema manually (else the persisted net_ema.*
             # keeps zero and drops the trained bias at checkpoint save). update_bias
             # already cross-rank-reduced, so net.expert_bias matches on every rank.
-            if self.config.ema.enabled:
+            if self.config.ema.enabled and not EMA_CPU_SUBSET:
+                # (CPU-subset mode reconstructs net_ema buffers from net at save
+                # time, so no live mirror is needed.)
                 sync_expert_biases_to_ema(net=self.net, net_ema=self.net_ema)
 
         # EMA-tracked token-constant de-sink bias (a checkpointed buffer). Independent of
@@ -549,7 +569,7 @@ class OmniMoTModel(ImaginaireModel):
         # be mirrored into net_ema (the model-EMA worker copies parameters only).
         if self._uses_ema_router_bias:
             update_router_biases(net=self.net, device_mesh=dp_mesh)
-            if self.config.ema.enabled:
+            if self.config.ema.enabled and not EMA_CPU_SUBSET:
                 sync_router_biases_to_ema(net=self.net, net_ema=self.net_ema)
 
     def on_before_zero_grad(
@@ -563,7 +583,19 @@ class OmniMoTModel(ImaginaireModel):
         if self.config.ema.enabled:
             # calculate beta for EMA update
             ema_beta = self.ema_beta(iteration)
-            self.net_ema_worker.update_average(self.net, self.net_ema, beta=ema_beta)
+            if EMA_CPU_SUBSET:
+                if self._cpu_ema is None:
+                    # Lazy init: by now the optimizer build has frozen all
+                    # non-selected params (requires_grad=False), so the
+                    # trainable set is exactly the keys_to_select subset.
+                    from cosmos_framework.utils.generator.cpu_subset_ema import CPUSubsetEMA
+
+                    trainable = [n for n, p in self.net.named_parameters() if p.requires_grad]
+                    self._cpu_ema = CPUSubsetEMA(self.net, trainable)
+                    self._cpu_ema.copy_to_from(self.net)
+                self._cpu_ema.update_average(self.net, beta=ema_beta)
+            else:
+                self.net_ema_worker.update_average(self.net, self.net_ema, beta=ema_beta)
 
     # ------------------------ helpers ------------------------
 
@@ -3399,11 +3431,33 @@ class OmniMoTModel(ImaginaireModel):
         )
 
         if self.config.ema.enabled:
-            ema_state_dict = self._net_state_dict(
-                self.net_ema,
-                prefix=prefix + "net_ema.",
-                keep_vars=keep_vars,
-            )
+            if EMA_CPU_SUBSET:
+                # Reconstruct the full net_ema.* dict: CPU EMA buffers for the
+                # trainable subset + fp32 casts of net for frozen params (exact,
+                # since frozen params never change). If no update has happened
+                # yet, every key falls back to the net value — identical to the
+                # stock worker's initial copy_to.
+                if self._cpu_ema is not None:
+                    ema_state_dict = self._cpu_ema.ema_state_dict(self.net, prefix=prefix + "net_ema.")
+                else:
+                    ema_state_dict = {
+                        k.replace(prefix + "net.", prefix + "net_ema.", 1): (
+                            v.detach().to(torch.float32) if torch.is_floating_point(v) else v
+                        )
+                        for k, v in reg_state_dict.items()
+                    }
+                if self.config.exclude_reasoner_weights_from_checkpoint:
+                    ema_state_dict = {
+                        k: v
+                        for k, v in ema_state_dict.items()
+                        if not _is_reasoner_state_dict_key(k.removeprefix(prefix + "net_ema."))
+                    }
+            else:
+                ema_state_dict = self._net_state_dict(
+                    self.net_ema,
+                    prefix=prefix + "net_ema.",
+                    keep_vars=keep_vars,
+                )
         else:
             ema_state_dict = {}
 
@@ -3468,9 +3522,21 @@ class OmniMoTModel(ImaginaireModel):
         unexpected_keys.extend(f"net.{k}" for k in reg_results.unexpected_keys)
 
         if self.config.ema.enabled:
-            ema_results = self._load_net_state_dict(self.net_ema, _ema_state_dict)
-            missing_keys.extend(f"net_ema.{k}" for k in ema_results.missing_keys)
-            unexpected_keys.extend(f"net_ema.{k}" for k in ema_results.unexpected_keys)
+            if EMA_CPU_SUBSET:
+                if len(_ema_state_dict) > 0:
+                    if self._cpu_ema is None:
+                        from cosmos_framework.utils.generator.cpu_subset_ema import CPUSubsetEMA
+
+                        trainable = [n for n, p in self.net.named_parameters() if p.requires_grad]
+                        if trainable:
+                            self._cpu_ema = CPUSubsetEMA(self.net, trainable)
+                    if self._cpu_ema is not None:
+                        self._cpu_ema.load_ema_state_dict(_ema_state_dict)
+                    # Frozen-key EMA values equal net values by construction; nothing to load.
+            else:
+                ema_results = self._load_net_state_dict(self.net_ema, _ema_state_dict)
+                missing_keys.extend(f"net_ema.{k}" for k in ema_results.missing_keys)
+                unexpected_keys.extend(f"net_ema.{k}" for k in ema_results.unexpected_keys)
 
         return _IncompatibleKeys(missing_keys=missing_keys, unexpected_keys=unexpected_keys)
 
@@ -4645,13 +4711,35 @@ class OmniMoTModel(ImaginaireModel):
 
         return cleaned_outputs
 
+    @contextmanager
+    def _vae_on_gpu(self):
+        """Move the (frozen) vision VAE to GPU for the duration of a call.
+
+        Active only under COSMOS_VAE_CPU_OFFLOAD: the VAE lives on CPU between
+        calls so its weights (~1.3 GiB bf16 for Wan2.2) don't occupy GPU memory
+        on memory-constrained single-GPU training. Encode is deterministic, so
+        outputs are identical to a GPU-resident VAE.
+        """
+        if not VAE_CPU_OFFLOAD:
+            yield
+            return
+        vae = self.tokenizer_vision_gen.model.model
+        vae.to("cuda")
+        try:
+            yield
+        finally:
+            vae.to("cpu")
+            torch.cuda.empty_cache()
+
     @torch.no_grad()
     def encode(self, state: torch.Tensor) -> torch.Tensor:
-        return self.tokenizer_vision_gen.encode(state)
+        with self._vae_on_gpu():
+            return self.tokenizer_vision_gen.encode(state)
 
     @torch.no_grad()
     def decode(self, latent: torch.Tensor) -> torch.Tensor:
-        return self.tokenizer_vision_gen.decode(latent)
+        with self._vae_on_gpu():
+            return self.tokenizer_vision_gen.decode(latent)
 
     @torch.no_grad()
     def encode_sound(self, waveform: torch.Tensor) -> torch.Tensor:
@@ -4710,6 +4798,27 @@ class OmniMoTModel(ImaginaireModel):
 
     @contextmanager
     def ema_scope(self, context=None, is_cpu=False):
+        if self.config.ema.enabled and EMA_CPU_SUBSET:
+            # CPU-subset mode: only trainable params differ from the live net;
+            # swap those in from the host buffers (no-op if EMA never updated).
+            for module in self.net.modules():
+                if isinstance(module, FSDPModule):
+                    module.reshard()
+            if self._cpu_ema is not None:
+                self._cpu_ema.swap_into(self.net)
+            if context is not None:
+                log.info(f"{context}: Switched to EMA weights (CPU subset)")
+            try:
+                yield None
+            finally:
+                for module in self.net.modules():
+                    if isinstance(module, FSDPModule):
+                        module.reshard()
+                if self._cpu_ema is not None:
+                    self._cpu_ema.swap_back(self.net)
+                if context is not None:
+                    log.info(f"{context}: Restored training weights")
+            return
         if self.config.ema.enabled:
             # https://github.com/pytorch/pytorch/issues/144289
             for module in self.net.modules():

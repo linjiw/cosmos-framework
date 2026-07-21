@@ -64,6 +64,22 @@ Used for checkpoint conversion and smoke tests.
 VERBOSE: Final[bool] = _get_bool("COSMOS_VERBOSE", INTERNAL)
 """Whether to enable verbose console output."""
 
+VAE_CPU_OFFLOAD: Final[bool] = _get_bool("COSMOS_VAE_CPU_OFFLOAD", False)
+"""Keep the vision VAE tokenizer on CPU and move it to GPU only for encode/decode calls.
+
+Saves the VAE's resident GPU memory (~1.3 GiB bf16 for Wan2.2) on memory-constrained
+single-GPU training at the cost of a PCIe round-trip per call. Encode is deterministic,
+so results are identical to keeping the VAE resident."""
+
+EMA_CPU_SUBSET: Final[bool] = _get_bool("COSMOS_EMA_CPU_SUBSET", False)
+"""Replace the full fp32 GPU ``net_ema`` clone with a CPU-resident EMA over the
+trainable-parameter subset only.
+
+During subset fine-tuning (``keys_to_select``) frozen parameters never change, so
+their EMA is identically their initial value — tracking only trainable params in
+pinned host memory is bit-equivalent to the stock full clone (~12.5 GiB GPU for
+Cosmos3-Edge) at zero GPU cost. See utils/generator/cpu_subset_ema.py."""
+
 EXPERIMENTAL_CHECKPOINTS: Final[bool] = _get_bool("COSMOS_EXPERIMENTAL_CHECKPOINTS", INTERNAL)
 """Whether to enable experimental checkpoints."""
 
