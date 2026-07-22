@@ -31,8 +31,24 @@ from cosmos_framework.utils import log
 from cosmos_framework.utils.misc import get_local_tensor_if_DTensor as dt2lt
 
 
+def _canon(name: str) -> str:
+    """Canonicalize a named_parameters() name to state_dict key format.
+
+    Activation-checkpoint wrappers inject ``_checkpoint_wrapped_module`` segments
+    into attribute paths; the wrapper's state-dict hooks strip them, so checkpoint
+    keys never contain them (torch DCP's FQN validation rejects keys that do).
+    ``_orig_mod`` (torch.compile) IS kept — stock state_dict keys retain it and
+    DCP's FQN walk handles it.
+    """
+    return name.replace("._checkpoint_wrapped_module", "")
+
+
 class CPUSubsetEMA:
-    """fp32 EMA over the ``keys_to_select`` parameter subset, pinned on CPU."""
+    """fp32 EMA over the ``keys_to_select`` parameter subset, pinned on CPU.
+
+    Buffers are keyed by canonical state-dict names (see :func:`_canon`) so the
+    reconstructed ``net_ema.*`` checkpoint entries match the stock key format.
+    """
 
     def __init__(self, net: torch.nn.Module, keys_to_select: list[str]):
         assert len(keys_to_select) > 0, "CPUSubsetEMA requires a non-empty keys_to_select"
@@ -42,10 +58,11 @@ class CPUSubsetEMA:
         self._swap_cache: list[torch.Tensor] | None = None
         for name, p in net.named_parameters():
             if any(k in name for k in self.keys_to_select):
+                cname = _canon(name)
                 local = dt2lt(p).detach()
-                self._buffers[name] = local.to(device="cpu", dtype=torch.float32).pin_memory()
+                self._buffers[cname] = local.to(device="cpu", dtype=torch.float32).pin_memory()
                 # bf16 staging buffer for async D2H of the live param
-                self._staging[name] = torch.empty_like(local, device="cpu").pin_memory()
+                self._staging[cname] = torch.empty_like(local, device="cpu").pin_memory()
         n_params = sum(b.numel() for b in self._buffers.values())
         log.info(
             f"CPUSubsetEMA: tracking {len(self._buffers)} tensors / {n_params / 1e9:.3f}B params "
@@ -58,6 +75,7 @@ class CPUSubsetEMA:
     def copy_to_from(self, net: torch.nn.Module) -> None:
         """Seed EMA buffers from the current net weights (fp32 upcast)."""
         for name, p in net.named_parameters():
+            name = _canon(name)
             if name in self._buffers:
                 self._buffers[name].copy_(dt2lt(p).detach().to(device="cpu", dtype=torch.float32))
 
@@ -66,6 +84,7 @@ class CPUSubsetEMA:
         """ema = beta * ema + (1 - beta) * param — same math as DTensorFastEmaModelUpdater."""
         names = []
         for name, p in net.named_parameters():
+            name = _canon(name)
             if name in self._buffers:
                 self._staging[name].copy_(dt2lt(p).detach(), non_blocking=True)
                 names.append(name)
@@ -83,6 +102,7 @@ class CPUSubsetEMA:
         assert self._swap_cache is None, "CPUSubsetEMA swap already active"
         cache = []
         for name, p in net.named_parameters():
+            name = _canon(name)
             if name in self._buffers:
                 local = dt2lt(p)
                 cache.append(local.detach().to("cpu", copy=True))
@@ -95,6 +115,7 @@ class CPUSubsetEMA:
         assert self._swap_cache is not None, "CPUSubsetEMA swap not active"
         it = iter(self._swap_cache)
         for name, p in net.named_parameters():
+            name = _canon(name)
             if name in self._buffers:
                 local = dt2lt(p)
                 local.data.copy_(next(it).to(device=local.device, dtype=local.dtype))
@@ -112,6 +133,7 @@ class CPUSubsetEMA:
         """
         out: dict[str, torch.Tensor] = {}
         for name, p in net.named_parameters():
+            name = _canon(name)
             if name in self._buffers:
                 out[prefix + name] = self._buffers[name].clone()
             else:
@@ -119,7 +141,7 @@ class CPUSubsetEMA:
         # buffers (non-parameter state, e.g. positional caches) mirror the net,
         # matching the stock worker which only lerps parameters.
         for name, b in net.named_buffers():
-            out[prefix + name] = dt2lt(b).detach().to(device="cpu")
+            out[prefix + _canon(name)] = dt2lt(b).detach().to(device="cpu")
         return out
 
     @torch.no_grad()
@@ -127,6 +149,7 @@ class CPUSubsetEMA:
         """Load net_ema.* values (already stripped of the prefix) into EMA buffers."""
         hit = 0
         for name, v in state_dict.items():
+            name = _canon(name)
             if name in self._buffers:
                 self._buffers[name].copy_(v.to(device="cpu", dtype=torch.float32))
                 hit += 1
