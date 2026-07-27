@@ -345,8 +345,8 @@ def load_model_from_checkpoint(
             of quantization options (e.g. ``method``, ``include_regex``, ``exclude_regex``).
             Quantization is applied in-place on the model parameters. Only works when model
             sharding (FSDP) is disabled. When ``method`` resolves to ``None``,
-            quantization is disabled. Only Blackwell architectures are supported. Valid
-            quantization methods are ``nvfp4`` and ``mxfp8``.
+            quantization is disabled. Valid methods: ``nvfp4`` and ``mxfp8``
+            (Blackwell-only) and ``int8wo`` (int8 weight-only, Ampere+).
         seed: Random seed used for initialization (if applicable).
         experiment_opts: Extra experiment/config override options.
         use_cache_checkpoint: If True, locally save & read remote checkpoints to speed up repeated loads.

@@ -558,6 +558,7 @@ class Cosmos3OmniModel(transformers.PreTrainedModel):
                         planner=_DiffusersLoadPlanner(checkpoint_path),
                         no_dist=no_dist,
                     )
+                    cls._apply_quantization(model, quantization_config)
                     return model
                 state_dict = get_model_state_dict(model)
                 _raise_on_missing_vision_keys(checkpoint_path, state_dict)
@@ -565,7 +566,27 @@ class Cosmos3OmniModel(transformers.PreTrainedModel):
             case _:
                 assert_never(checkpoint_type)
         dcp.load(state_dict=state_dict, storage_reader=storage_reader)
+        cls._apply_quantization(model, quantization_config)
         return model
+
+    @classmethod
+    def _apply_quantization(cls, model: "Cosmos3OmniModel", quantization_config: QuantizationConfig) -> None:
+        """Apply the load-time PTQ recipe to the freshly loaded model.
+
+        Must run only after ALL checkpoint weights are loaded (``quantize_``
+        replaces the live params with quantized tensor subclasses, which a
+        later ``load_state_dict`` into the same modules would not survive).
+        Edge's lazily loaded SigLIP tower is safe: it materializes new modules
+        under ``language_model.visual``, which the default include regex
+        (``language_model.model.layers``) does not match. Sharded (DTensor)
+        models are rejected by the callee's plain-tensor requirement — this
+        classmethod is only reached on the replicated inference path.
+        """
+        if quantization_config.method is None:
+            return
+        from cosmos_framework.utils.generator.quantization import apply_quantization_inplace
+
+        apply_quantization_inplace(model.model, quantization_config)
 
     @classmethod
     def before_load_model(cls):
