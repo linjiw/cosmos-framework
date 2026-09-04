@@ -29,6 +29,7 @@
         <a href="#system">System</a>
         <a href="#demos">Demos</a>
         <a href="#quality">Quality</a>
+        <a href="#navigation">Navigation</a>
       </nav>
       <a class="header-cta" href="#reproduce">Run locally <span aria-hidden="true">↘</span></a>
     </header>
@@ -284,9 +285,72 @@
         </div>
       </section>
 
+      <section class="section-shell navigation-section" id="navigation">
+        <div class="section-heading reveal">
+          <div><span class="section-index">05</span><span class="eyebrow">Humanoid navigation pilot</span></div>
+          <h2>A useful prior.<br />Not yet a policy.</h2>
+          <p>
+            Three collision-avoidance prompts × seeds 17–19. These are open-loop generated videos, scored for
+            exact ordered behavior—not closed-loop robot trials.
+          </p>
+        </div>
+
+        <div class="navigation-summary reveal">
+          <article class="navigation-score">
+            <span class="chart-kicker">Strict temporal completion</span>
+            <strong>0<span>/9</span></strong>
+            <p>
+              Every inference job produced a valid clip. None showed all requested agents, geometry, action
+              phases, and final state in the correct order.
+            </p>
+          </article>
+          <article class="navigation-reading">
+            <span class="chart-kicker">What the pilot says</span>
+            <h3>Scene ingredients transfer before task structure.</h3>
+            <p>
+              The base model often renders a humanoid, box, pedestrian, or barrier, but does not reliably compose
+              approach, avoid or yield, and recovery into one clip. That is the clearest signal for domain video
+              SFT followed by action-policy training.
+            </p>
+            <dl>
+              <div><dt>Video</dt><dd>25 frames · 10 FPS · 256p</dd></div>
+              <div><dt>Sampling</dt><dd>35 UniPC steps · INT8WO</dd></div>
+              <div><dt>Peak process VRAM</dt><dd>8,214 MiB</dd></div>
+            </dl>
+          </article>
+        </div>
+
+        <div class="navigation-cases reveal">
+          <article class="navigation-case">
+            <video controls muted loop playsinline poster="assets/humanoid-static-slalom-seed17-strip.jpg" preload="metadata">
+              <source src="assets/humanoid-static-slalom-seed17.mp4" type="video/mp4" />
+            </video>
+            <div><span>01 · static obstacle</span><h3>Corridor slalom</h3><p>The seed-17 clip omits the box and never makes the requested left-pass-and-recenter maneuver.</p></div>
+          </article>
+          <article class="navigation-case">
+            <video controls muted loop playsinline poster="assets/humanoid-pedestrian-yield-seed17-strip.jpg" preload="metadata">
+              <source src="assets/humanoid-pedestrian-yield-seed17.mp4" type="video/mp4" />
+            </video>
+            <div><span>02 · dynamic obstacle</span><h3>Pedestrian yield</h3><p>The pedestrian crosses, but the robot stays stationary; approach, stop, and resume are not all visible.</p></div>
+          </article>
+          <article class="navigation-case">
+            <video controls muted loop playsinline poster="assets/humanoid-stepover-seed17-strip.jpg" preload="metadata">
+              <source src="assets/humanoid-stepover-seed17.mp4" type="video/mp4" />
+            </video>
+            <div><span>03 · foot placement</span><h3>Low barrier</h3><p>The barrier and robot appear, but both feet never visibly complete the requested clearance sequence.</p></div>
+          </article>
+        </div>
+
+        <div class="navigation-boundary reveal">
+          <strong>Research boundary</strong>
+          <p>Visual plausibility cannot establish collision safety. The next evidence tier is action-conditioned, closed-loop simulation with contact sensors, fall detection, and held-out layouts.</p>
+          <a href="https://github.com/linjiw/cosmos-framework/blob/feat/cosmos3edge-10gb-main/docs/humanoid_navigation_research.md">Read the fine-tuning and evaluation plan <span aria-hidden="true">↗</span></a>
+        </div>
+      </section>
+
       <section class="section-shell reproduce-section" id="reproduce">
         <div class="section-heading reveal">
-          <div><span class="section-index">05</span><span class="eyebrow">Reproduce locally</span></div>
+          <div><span class="section-index">06</span><span class="eyebrow">Reproduce locally</span></div>
           <h2>Run the same path.</h2>
           <p>No web framework and no hosted services. Serve this page or reproduce the inference directly from the repository.</p>
         </div>
@@ -311,6 +375,18 @@ python -m cosmos_framework.scripts.inference \
 
 # Results
 cat outputs/edge_int8_quality/metrics.json</code></pre>
+          </article>
+          <article class="code-card">
+            <div class="code-title"><span>Humanoid prompt pilot</span><button class="copy-button" type="button" data-copy="code-humanoid">Copy</button></div>
+            <pre><code id="code-humanoid">COSMOS_VAE_CPU_OFFLOAD=1 LD_LIBRARY_PATH='' \
+python -m cosmos_framework.scripts.inference \
+  --parallelism-preset=latency \
+  -i inputs/experiments/humanoid_navigation_t2v.jsonl \
+  -o outputs/humanoid_navigation_edge_int8wo \
+  --checkpoint-path=Cosmos3-Edge \
+  --quantization-method=int8wo \
+  --use-torch-compile --no-guardrails \
+  --num-outputs=3 --seed=17</code></pre>
           </article>
         </div>
 
