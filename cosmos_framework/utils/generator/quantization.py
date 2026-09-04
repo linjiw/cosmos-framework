@@ -16,7 +16,9 @@ support. Module selection is delegated to the filter built by
 """
 
 import re
+from typing import Any
 
+import torch
 from torch import nn
 
 from cosmos_framework.configs.base.defaults.quantization import QuantizationConfig
@@ -86,6 +88,100 @@ def _get_filter_fn(quantization_config: QuantizationConfig):
     return _filter_fn
 
 
+def should_quantize_module(module: nn.Module, fqn: str, quantization_config: QuantizationConfig) -> bool:
+    """Return whether ``module`` is selected by a quantization recipe."""
+    return _get_filter_fn(quantization_config)(module, fqn)
+
+
+def _gate_cuda_woq_pattern_to_cpu():
+    """Restore torch<=2.9 behavior: weight-only-quant pattern rewrite on CPU only.
+
+    torch 2.10 enabled an inductor pattern (pytorch#161680) that rewrites the
+    int8 dequant+mm graph into ``aten._weight_int8pack_mm`` on CUDA. That CUDA
+    kernel is a thread-per-output GEMV — measured ~150x slower than the
+    dequant+cublas route it replaces at diffusion batch sizes (M~12k) on
+    sm_86. Gating the pattern back to CPU keeps compiled int8wo at ~bf16
+    speed. Must run before the first compiled forward of a quantized module
+    (the pattern's validity check is captured at lazy registration).
+    """
+    try:
+        from torch._inductor.fx_passes import quantization as _q
+
+        orig = _q._is_valid_woq_optimization_pattern
+
+        def _cpu_only_check(*args, **kwargs):
+            inner = orig(*args, **kwargs)
+
+            def check(match):
+                if not inner(match):
+                    return False
+                x = match.kwargs.get("x")
+                return x is not None and x.meta["val"].device.type == "cpu"
+
+            return check
+
+        # Idempotent: only patch once.
+        if getattr(_q._is_valid_woq_optimization_pattern, "_cosmos_cpu_gated", False):
+            return
+        _cpu_only_check._cosmos_cpu_gated = True  # type: ignore[attr-defined]
+        _q._is_valid_woq_optimization_pattern = _cpu_only_check
+    except Exception:
+        # Older/newer torch without the pattern: nothing to gate.
+        pass
+
+
+def _get_torchao_config(method: str) -> Any:
+    """Construct the torchao recipe shared by bulk and streaming PTQ."""
+    if method == "int8wo":
+        from torchao.quantization import Int8WeightOnlyConfig
+
+        _gate_cuda_woq_pattern_to_cpu()
+        return Int8WeightOnlyConfig(version=2, set_inductor_config=False)
+    if method == "int8dq":
+        from torchao.quantization import Int8DynamicActivationInt8WeightConfig
+
+        return Int8DynamicActivationInt8WeightConfig(version=2, set_inductor_config=False)
+    if method == "mxfp8":
+        from torchao.prototype.mx_formats import MXDynamicActivationMXWeightConfig
+
+        return MXDynamicActivationMXWeightConfig()
+    if method == "nvfp4":
+        from torchao.prototype.mx_formats import NVFP4DynamicActivationNVFP4WeightConfig
+
+        # Avoid the external mslk ABI dependency in NGC torch builds.
+        return NVFP4DynamicActivationNVFP4WeightConfig(use_triton_kernel=False)
+    raise ValueError(f"Unsupported quantization method: {method}")
+
+
+def quantize_linear_weight(weight: torch.Tensor, method: str) -> torch.Tensor:
+    """Quantize one CPU Linear weight without first materializing BF16 on CUDA.
+
+    This deliberately uses torchao's public ``quantize_`` transformation on a
+    temporary one-layer module instead of constructing its tensor subclass by
+    hand. The resulting representation is therefore exactly the same as the
+    normal post-load quantization path, including dynamic-activation metadata.
+    """
+    if method not in {"int8wo", "int8dq"}:
+        raise ValueError(f"Streaming quantization does not support method {method!r}.")
+    if weight.ndim != 2:
+        raise ValueError(f"Linear weights must be two-dimensional, got shape {tuple(weight.shape)}.")
+    if weight.device.type != "cpu":
+        weight = weight.cpu()
+
+    from torchao.quantization import quantize_
+
+    linear = nn.Linear(
+        in_features=weight.shape[1],
+        out_features=weight.shape[0],
+        bias=False,
+        device="meta",
+        dtype=weight.dtype,
+    )
+    linear.weight = nn.Parameter(weight, requires_grad=False)
+    quantize_(linear, config=_get_torchao_config(method))
+    return linear.weight
+
+
 def apply_quantization_inplace(model: nn.Module, quantization_config: QuantizationConfig):
     """Apply quantization in place via ``quantize_`` (replaces weights with quantized tensors).
 
@@ -96,8 +192,9 @@ def apply_quantization_inplace(model: nn.Module, quantization_config: Quantizati
     to replicated inference (``data_parallel_shard_degree == 1``).
 
     These configs (``MXDynamicActivationMXWeightConfig`` /
-    ``NVFP4DynamicActivationNVFP4WeightConfig``) are inference-only (PTQ) and
-    have no backward support. For the sharded case use ``apply_quantization``
+    ``NVFP4DynamicActivationNVFP4WeightConfig`` — Blackwell tensor cores — and
+    ``Int8WeightOnlyConfig`` — Ampere+) are inference-only (PTQ) and have no
+    backward support. For the sharded case use ``apply_quantization``
     (the module-swap path) instead; both functions are currently inference
     paths, selected by whether FSDP is sharding the model.
     """
@@ -105,19 +202,38 @@ def apply_quantization_inplace(model: nn.Module, quantization_config: Quantizati
     if quantization_config.method is None:
         return
 
-    from torchao.prototype.mx_formats import (
-        MXDynamicActivationMXWeightConfig,
-        NVFP4DynamicActivationNVFP4WeightConfig,
-    )
-    from torchao.quantization import (
-        quantize_,
-    )
+    from torchao.quantization import quantize_
 
-    if quantization_config.method == "mxfp8":
+    if quantization_config.method == "int8wo":
+        # int8 weight-only: weights stored int8 (per-channel scales), compute
+        # stays bf16 (dequant per matmul). No fp8/fp4 tensor cores needed, so
+        # this is the method that runs on pre-Blackwell GPUs (Ampere+). Unlike
+        # the dynamic-activation configs above it quantizes weights only.
+        # set_inductor_config=False: the default would flip global inductor
+        # flags, changing how the model's non-quantized remainder compiles and
+        # confounding any quantized-vs-bf16 comparison.
+        quantize_(
+            model,
+            config=_get_torchao_config(quantization_config.method),
+            filter_fn=_get_filter_fn(quantization_config),
+        )
+    elif quantization_config.method == "int8dq":
+        # int8 dynamic-activation + int8 weight (W8A8): routes matmuls through
+        # torch._int_mm (INT8 tensor cores, sm_75+). Same int8 weight storage
+        # as int8wo (same memory saving) but compute-bound layers get FASTER
+        # than bf16 at diffusion batch sizes. Requires torch.compile for speed
+        # (eager W8A8 is very slow); adds per-token activation rounding on top
+        # of weight rounding — revalidate quality vs int8wo before adopting.
+        quantize_(
+            model,
+            config=_get_torchao_config(quantization_config.method),
+            filter_fn=_get_filter_fn(quantization_config),
+        )
+    elif quantization_config.method == "mxfp8":
         # mxfp8 / nvfp4 use fixed block scales.
         quantize_(
             model,
-            config=MXDynamicActivationMXWeightConfig(),
+            config=_get_torchao_config(quantization_config.method),
             filter_fn=_get_filter_fn(quantization_config),
         )
     elif quantization_config.method == "nvfp4":
@@ -128,7 +244,7 @@ def apply_quantization_inplace(model: nn.Module, quantization_config: Quantizati
         # built-in NVFP4 path instead.
         quantize_(
             model,
-            config=NVFP4DynamicActivationNVFP4WeightConfig(use_triton_kernel=False),
+            config=_get_torchao_config(quantization_config.method),
             filter_fn=_get_filter_fn(quantization_config),
         )
     else:

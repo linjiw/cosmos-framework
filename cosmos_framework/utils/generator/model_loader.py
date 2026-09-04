@@ -35,15 +35,15 @@ except ImportError:  # Older filelock versions in some inference containers.
 
 from torch.distributed.checkpoint.filesystem import FileSystemReader, FileSystemWriter
 
+from cosmos_framework.checkpoint.dcp import CustomLoadPlanner, CustomSavePlanner, ModelWrapper
 from cosmos_framework.checkpoint.s3_filesystem import S3StorageReader
-from cosmos_framework.utils.lazy_config import instantiate
+from cosmos_framework.configs.base.defaults.quantization import QuantizationConfig
+from cosmos_framework.model.generator.utils.safetensors_loader import load_vfm_model
 from cosmos_framework.utils import log, misc
 from cosmos_framework.utils.config_helper import get_config_module, override
 from cosmos_framework.utils.easy_io import easy_io
-from cosmos_framework.checkpoint.dcp import CustomLoadPlanner, CustomSavePlanner, ModelWrapper
-from cosmos_framework.configs.base.defaults.quantization import QuantizationConfig
-from cosmos_framework.model.generator.utils.safetensors_loader import load_vfm_model
 from cosmos_framework.utils.generator.quantization import apply_quantization_inplace
+from cosmos_framework.utils.lazy_config import instantiate
 
 ###################################################
 # below are the load_model function for inference #
@@ -345,8 +345,9 @@ def load_model_from_checkpoint(
             of quantization options (e.g. ``method``, ``include_regex``, ``exclude_regex``).
             Quantization is applied in-place on the model parameters. Only works when model
             sharding (FSDP) is disabled. When ``method`` resolves to ``None``,
-            quantization is disabled. Only Blackwell architectures are supported. Valid
-            quantization methods are ``nvfp4`` and ``mxfp8``.
+            quantization is disabled. Valid methods: ``nvfp4`` and ``mxfp8``
+            (Blackwell-only), ``int8wo`` (int8 weight-only, Ampere+), and
+            ``int8dq`` (W8A8, Ampere+).
         seed: Random seed used for initialization (if applicable).
         experiment_opts: Extra experiment/config override options.
         use_cache_checkpoint: If True, locally save & read remote checkpoints to speed up repeated loads.

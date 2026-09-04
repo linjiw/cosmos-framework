@@ -5,12 +5,12 @@ from typing import Any
 
 import attrs
 
-from cosmos_framework.utils.lazy_config import LazyDict
 from cosmos_framework.configs.base.defaults.activation_checkpointing import ActivationCheckpointingConfig
 from cosmos_framework.configs.base.defaults.compile import CompileConfig
 from cosmos_framework.configs.base.defaults.ema import EMAConfig
 from cosmos_framework.configs.base.defaults.parallelism import ParallelismConfig
 from cosmos_framework.configs.base.defaults.reasoner import VLMConfig
+from cosmos_framework.utils.lazy_config import LazyDict
 
 
 @attrs.define(slots=False)
@@ -146,6 +146,12 @@ class OmniMoTModelConfig:
     # ``model.precision`` for LowPrecisionCallback). One of "bfloat16",
     # "float16", "float32".
     precision: str = "bfloat16"
+
+    # Inference-only checkpoint loading optimization. Keep checkpoint-backed
+    # parameters on ``meta`` after model construction so the Diffusers loader
+    # can materialize (and, for INT8, quantize) one tensor at a time. Training
+    # and non-Diffusers loaders retain the normal eager materialization path.
+    defer_model_materialization: bool = False
 
     # LoRA (parameter-efficient fine-tuning). When `lora_enabled=True`,
     # `OmniMoTModel.build_net` injects custom LoRA adapters BEFORE FSDP wrap on

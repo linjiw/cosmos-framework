@@ -88,6 +88,30 @@ python -m cosmos_framework.scripts.inference \
     --seed=0
 ```
 
+For a memory-constrained single-GPU run, INT8 weight-only quantization cuts the
+MoT tower's persistent weight memory while keeping BF16 compute. VAE CPU offload
+frees additional memory between encode/decode calls:
+
+```shell
+COSMOS_VAE_CPU_OFFLOAD=1 python -m cosmos_framework.scripts.inference \
+    --parallelism-preset=latency \
+    -i "inputs/omni/t2i.json" \
+    -o outputs/omni_edge_int8wo \
+    --checkpoint-path Cosmos3-Edge \
+    --quantization-method=int8wo \
+    --use-torch-compile \
+    --no-guardrails \
+    --seed=0
+```
+
+`int8dq` enables W8A8 tensor-core execution and may be faster, but activation
+rounding and temporary workspace can increase quality risk and peak memory; use
+it only after validating the target mode against an INT8WO or BF16 baseline.
+For Diffusers-format checkpoints, INT8WO/INT8DQ loading is streamed: each
+selected Linear weight is quantized on CPU before it is moved to CUDA, avoiding
+a full-model BF16 startup allocation. Native DCP and root-safetensors loading
+still use post-load quantization and can therefore have a larger startup peak.
+
 To run every supported example in one batch (the `action_*.json` glob covers the action modes; the audio-enabled `t2vs.json` / `i2vs.json` are intentionally excluded):
 
 ```shell

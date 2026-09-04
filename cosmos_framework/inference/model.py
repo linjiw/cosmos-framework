@@ -28,7 +28,7 @@ from torch.distributed.checkpoint.metadata import (
     TensorProperties,
     TensorStorageMetadata,
 )
-from torch.distributed.checkpoint.planner import MetadataIndex
+from torch.distributed.checkpoint.planner import MetadataIndex, ReadItem
 from torch.distributed.checkpoint.state_dict import get_model_state_dict
 from typing_extensions import TYPE_CHECKING, assert_never
 
@@ -43,8 +43,8 @@ from cosmos_framework.inference.common.public_model_config import (
     model_config_uses_public_aliases,
     restore_model_config_from_public_model_config,
 )
-from cosmos_framework.utils import misc
-from cosmos_framework.utils.flags import SMOKE
+from cosmos_framework.utils import log, misc
+from cosmos_framework.utils.flags import DEVICE, SMOKE
 
 if TYPE_CHECKING:
     from cosmos_framework.model.generator.omni_mot_model import OmniMoTModel
@@ -364,10 +364,20 @@ class _DiffusersLoadPlanner(dcp.DefaultLoadPlanner):
         metadata: Metadata | None = None,
         is_coordinator: bool = False,
     ) -> None:
+        remapped_state_dict = self._prepare_state_dict(state_dict)
+
+        super().set_up_planner(
+            state_dict=remapped_state_dict,
+            metadata=metadata,
+            is_coordinator=is_coordinator,
+        )
+
+    def _prepare_state_dict(self, state_dict: dict[str, Any]) -> dict[str, Any]:
         target_state_dict = self._normalize_target_state_dict(state_dict)
         remapped_state_dict, loaded_keys = self._build_remapped_state_dict(target_state_dict)
 
-        missing_keys = set(target_state_dict) - loaded_keys
+        missing_target_keys = set(target_state_dict) - loaded_keys
+        missing_keys = set(missing_target_keys)
         if not self.has_vision_weights:
             missing_keys = {key for key in missing_keys if not key.startswith("language_model.visual.")}
         # Task-specialized checkpoints (e.g. Text2Image, Image2Video) omit the
@@ -386,12 +396,8 @@ class _DiffusersLoadPlanner(dcp.DefaultLoadPlanner):
                 f"Diffusers checkpoint at {self.checkpoint_path} did not provide {len(missing_keys)} "
                 f"required model tensor(s). First up to 10: {sample}"
             )
-
-        super().set_up_planner(
-            state_dict=remapped_state_dict,
-            metadata=metadata,
-            is_coordinator=is_coordinator,
-        )
+        self.missing_target_keys = missing_target_keys
+        return remapped_state_dict
 
     @staticmethod
     def _normalize_target_state_dict(state_dict: dict[str, Any]) -> dict[str, Any]:
@@ -406,6 +412,7 @@ class _DiffusersLoadPlanner(dcp.DefaultLoadPlanner):
     def _build_remapped_state_dict(self, target_state_dict: dict[str, Any]) -> tuple[dict[str, Any], set[str]]:
         remapped_state_dict: dict[str, Any] = {}
         loaded_keys: set[str] = set()
+        self.target_keys_by_source: dict[str, str] = {}
         # When the model is built without a visual tower (e.g. Cosmos3-Edge t2i with
         # include_visual disabled), its state dict has no `language_model.visual.*`
         # targets, so the checkpoint's vision_encoder weights have nowhere to go — skip
@@ -425,8 +432,133 @@ class _DiffusersLoadPlanner(dcp.DefaultLoadPlanner):
             if net_key in loaded_keys:
                 raise KeyError(f"Multiple diffusers keys map to target model key {net_key!r}.")
             remapped_state_dict[diff_key] = target_tensor
+            self.target_keys_by_source[diff_key] = net_key
             loaded_keys.add(net_key)
         return remapped_state_dict, loaded_keys
+
+
+class _StreamingDiffusersLoadPlanner(_DiffusersLoadPlanner):
+    """Load a Diffusers checkpoint into a meta model one tensor at a time.
+
+    Selected Linear weights are quantized on CPU before their compact tensor
+    subclasses move to the execution device. Other tensors move directly from
+    the safetensors CPU view to that device. This avoids ever materializing a
+    complete BF16 copy of the model on GPU during INT8 checkpoint loading.
+    """
+
+    def __init__(
+        self,
+        checkpoint_path: Path,
+        model: torch.nn.Module,
+        quantization_config: QuantizationConfig,
+        device: str | torch.device = str(DEVICE),
+    ) -> None:
+        if quantization_config.method not in {"int8wo", "int8dq"}:
+            raise ValueError(
+                f"Streaming Diffusers loading supports only int8wo and int8dq, got {quantization_config.method!r}."
+            )
+        super().__init__(checkpoint_path)
+        self.model = model
+        self.quantization_config = quantization_config
+        self.device = torch.device(device)
+        # The remapped dict is already flat, and preserving meta tensors here
+        # is the point of this planner. DefaultLoadPlanner.set_up_planner would
+        # eagerly replace every meta tensor with a full-size CUDA allocation.
+        self.flatten_state_dict = False
+        self.flatten_sharded_tensors = False
+
+    def set_up_planner(
+        self,
+        state_dict: dict[str, Any],
+        metadata: Metadata | None = None,
+        is_coordinator: bool = False,
+    ) -> None:
+        remapped_state_dict = self._prepare_state_dict(state_dict)
+        self.original_state_dict = remapped_state_dict
+        self.state_dict = remapped_state_dict
+        self.metadata = metadata
+        self.is_coordinator = is_coordinator
+
+        # Optional heads omitted by task-specialized checkpoints used to retain
+        # their initialized values. Materialize only those missing tensors now;
+        # all checkpoint-backed tensors remain meta until their individual read.
+        if self.missing_target_keys:
+            for target_key in sorted(self.missing_target_keys):
+                target = self._target_tensor(target_key)
+                if target.device.type == "meta":
+                    self._assign_target_tensor(target_key, torch.empty_like(target, device=self.device))
+            init_weights = getattr(self.model, "init_weights", None)
+            if init_weights is not None:
+                init_weights(buffer_device=self.device)
+
+    def resolve_tensor(self, read_item: ReadItem) -> torch.Tensor:
+        target = self.lookup_tensor(read_item.dest_index)
+        if target.device.type != "meta":
+            raise RuntimeError(
+                f"Streaming load expected a meta target for {read_item.dest_index.fqn!r}, got {target.device}."
+            )
+        return torch.empty(tuple(read_item.lengths), dtype=target.dtype, device="cpu")
+
+    def commit_tensor(self, read_item: ReadItem, tensor: torch.Tensor) -> None:
+        source_key = read_item.dest_index.fqn
+        target_key = self.target_keys_by_source[source_key]
+        target = self.lookup_tensor(read_item.dest_index)
+        if any(read_item.dest_offsets) or tuple(read_item.lengths) != tuple(target.shape):
+            raise RuntimeError(
+                "Streaming Diffusers loading requires one complete checkpoint chunk per tensor; "
+                f"got offsets={tuple(read_item.dest_offsets)}, lengths={tuple(read_item.lengths)}, "
+                f"target_shape={tuple(target.shape)} for {source_key!r}."
+            )
+
+        module_key, _, tensor_name = target_key.rpartition(".")
+        module = self.model.get_submodule(module_key) if module_key else self.model
+        from cosmos_framework.utils.generator.quantization import quantize_linear_weight, should_quantize_module
+
+        if tensor_name == "weight" and should_quantize_module(module, module_key, self.quantization_config):
+            tensor = quantize_linear_weight(tensor, self.quantization_config.method)
+            requires_grad = False
+        else:
+            requires_grad = None
+
+        assigned = tensor.to(self.device)
+        self._assign_target_tensor(target_key, assigned, requires_grad=requires_grad)
+        # Keep the planner's state dict coherent without retaining the CPU BF16
+        # staging tensor after this callback returns.
+        self.state_dict[source_key] = assigned
+
+    def _target_tensor(self, target_key: str) -> torch.Tensor:
+        module_key, _, tensor_name = target_key.rpartition(".")
+        module = self.model.get_submodule(module_key) if module_key else self.model
+        if tensor_name in module._parameters:
+            tensor = module._parameters[tensor_name]
+        elif tensor_name in module._buffers:
+            tensor = module._buffers[tensor_name]
+        else:
+            raise KeyError(f"Target model tensor {target_key!r} is neither a parameter nor a buffer.")
+        if tensor is None:
+            raise KeyError(f"Target model tensor {target_key!r} is registered as None.")
+        return tensor
+
+    def _assign_target_tensor(
+        self,
+        target_key: str,
+        tensor: torch.Tensor,
+        *,
+        requires_grad: bool | None = None,
+    ) -> None:
+        module_key, _, tensor_name = target_key.rpartition(".")
+        module = self.model.get_submodule(module_key) if module_key else self.model
+        if tensor_name in module._parameters:
+            old_parameter = module._parameters[tensor_name]
+            if old_parameter is None:
+                raise KeyError(f"Target model parameter {target_key!r} is registered as None.")
+            if requires_grad is None:
+                requires_grad = old_parameter.requires_grad
+            module._parameters[tensor_name] = torch.nn.Parameter(tensor, requires_grad=requires_grad)
+        elif tensor_name in module._buffers:
+            module._buffers[tensor_name] = tensor
+        else:
+            raise KeyError(f"Target model tensor {target_key!r} is neither a parameter nor a buffer.")
 
 
 class Cosmos3OmniConfig(transformers.PretrainedConfig):
@@ -527,9 +659,25 @@ class Cosmos3OmniModel(transformers.PreTrainedModel):
             compile_config = CompileConfig()
         if quantization_config is None:
             quantization_config = QuantizationConfig()
+        if quantization_config.method is not None and parallelism_config.data_parallel_shard_degree > 1:
+            raise ValueError("Quantization is not supported for DP sharded models.")
         config.parallelism = attrs.asdict(parallelism_config)
         config.compile = attrs.asdict(compile_config)
         config.quantization = attrs.asdict(quantization_config)
+        checkpoint_type = CheckpointType.from_path(checkpoint_path)
+        distributed = (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size() > 1
+        )
+        stream_quantization = (
+            not distributed
+            and checkpoint_type == CheckpointType.HF
+            and _is_diffusers_checkpoint(checkpoint_path)
+            and quantization_config.method in {"int8wo", "int8dq"}
+        )
+        if stream_quantization:
+            config.model.setdefault("config", {})["defer_model_materialization"] = True
         model = cls(config)
         # Thread the local checkpoint dir to the reasoner LM (consumed by Edge's
         # lazy ``_ensure_vision_tower``): checkpoints that bundle a
@@ -538,7 +686,6 @@ class Cosmos3OmniModel(transformers.PreTrainedModel):
         language_model = getattr(getattr(model.model, "net", None), "language_model", None)
         if language_model is not None:
             language_model._local_checkpoint_dir = str(checkpoint_path)
-        checkpoint_type = CheckpointType.from_path(checkpoint_path)
         match checkpoint_type:
             case CheckpointType.DCP:
                 state_dict = get_model_state_dict(model.model)
@@ -552,12 +699,27 @@ class Cosmos3OmniModel(transformers.PreTrainedModel):
                     # code objects"). no_dist loads locally without collectives.
                     _dist = torch.distributed
                     no_dist = not (_dist.is_available() and _dist.is_initialized() and _dist.get_world_size() > 1)
+                    planner: _DiffusersLoadPlanner
+                    if stream_quantization:
+                        log.info(
+                            f"Streaming {quantization_config.method} checkpoint load: "
+                            "selected Linear weights are quantized on CPU before CUDA materialization"
+                        )
+                        planner = _StreamingDiffusersLoadPlanner(
+                            checkpoint_path,
+                            model=model.model.net,
+                            quantization_config=quantization_config,
+                        )
+                    else:
+                        planner = _DiffusersLoadPlanner(checkpoint_path)
                     dcp.load(
                         state_dict=state_dict,
                         storage_reader=_DiffusersHuggingFaceStorageReader(checkpoint_path),
-                        planner=_DiffusersLoadPlanner(checkpoint_path),
+                        planner=planner,
                         no_dist=no_dist,
                     )
+                    if not stream_quantization:
+                        cls._apply_quantization(model, quantization_config)
                     return model
                 state_dict = get_model_state_dict(model)
                 _raise_on_missing_vision_keys(checkpoint_path, state_dict)
@@ -565,7 +727,27 @@ class Cosmos3OmniModel(transformers.PreTrainedModel):
             case _:
                 assert_never(checkpoint_type)
         dcp.load(state_dict=state_dict, storage_reader=storage_reader)
+        cls._apply_quantization(model, quantization_config)
         return model
+
+    @classmethod
+    def _apply_quantization(cls, model: "Cosmos3OmniModel", quantization_config: QuantizationConfig) -> None:
+        """Apply the load-time PTQ recipe to the freshly loaded model.
+
+        Must run only after ALL checkpoint weights are loaded (``quantize_``
+        replaces the live params with quantized tensor subclasses, which a
+        later ``load_state_dict`` into the same modules would not survive).
+        Edge's lazily loaded SigLIP tower is safe: it materializes new modules
+        under ``language_model.visual``, which the default include regex
+        (``language_model.model.layers``) does not match. Sharded (DTensor)
+        models are rejected by the callee's plain-tensor requirement — this
+        classmethod is only reached on the replicated inference path.
+        """
+        if quantization_config.method is None:
+            return
+        from cosmos_framework.utils.generator.quantization import apply_quantization_inplace
+
+        apply_quantization_inplace(model.model, quantization_config)
 
     @classmethod
     def before_load_model(cls):

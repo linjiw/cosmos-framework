@@ -431,8 +431,7 @@ class CheckpointType(StrEnum):
         transformer_path = path / "transformer"
         has_root_hf_weights = any(path.glob("*.safetensors")) or any(path.glob("*.safetensors.index.json"))
         has_diffusers_hf_weights = (path / "model_index.json").is_file() and (
-            any(transformer_path.glob("*.safetensors"))
-            or any(transformer_path.glob("*.safetensors.index.json"))
+            any(transformer_path.glob("*.safetensors")) or any(transformer_path.glob("*.safetensors.index.json"))
         )
         has_hf_weights = has_root_hf_weights or has_diffusers_hf_weights
         if has_hf_weights:
@@ -627,12 +626,14 @@ CfgpSize = Annotated[int, pydantic.Field(ge=1, le=2)]
 CompiledRegion = Literal["all", "language"]
 
 # Low-precision quantization method to apply to the model at load time.
-# One of ``mxfp8`` / ``nvfp4``, or ``None`` (default) to disable.
+# One of ``mxfp8`` / ``nvfp4`` / ``int8wo`` / ``int8dq``, or ``None``
+# (default) to disable.
 # Routed to the VFM model loader, which selects an FSDP-compatible
 # (module-swap) path when sharded (``dp_shard_size > 1``) and an in-place
 # path when replicated (``dp_shard_size == 1``). Note ``mxfp8`` / ``nvfp4``
-# are only supported on the replicated path.
-QuantizationMethod = Literal["mxfp8", "nvfp4"]
+# are only supported on the replicated path and need Blackwell tensor cores;
+# ``int8wo`` (int8 weight-only storage, bf16 compute) runs on Ampere+.
+QuantizationMethod = Literal["mxfp8", "nvfp4", "int8wo", "int8dq"]
 
 
 class QuantizationArgs(ArgsBase):
@@ -645,10 +646,12 @@ class QuantizationArgs(ArgsBase):
 
 class QuantizationOverrides(OverridesBase):
     quantization_method: QuantizationMethod | None = None
-    """Quantization method (``mxfp8`` / ``nvfp4``), or ``None`` to disable.
+    """Quantization method (``mxfp8`` / ``nvfp4`` / ``int8wo`` / ``int8dq``), or ``None`` to disable.
 
     Post-training quantization (PTQ) is applied in-place to the model at load
-    time. Only supported on Blackwell architectures and when FSDP sharding is disabled.
+    time, only when FSDP sharding is disabled. ``mxfp8``/``nvfp4`` require
+    Blackwell architectures; ``int8wo`` (weight-only) and ``int8dq`` (W8A8,
+    INT8 tensor cores) work on Ampere and newer.
     """
     quantization_include_regex: list[str] = ["language_model.model.layers"]
     """Regexes matched against module FQNs; a Linear is quantized only if it matches one (empty = all)."""

@@ -64,6 +64,13 @@ Used for checkpoint conversion and smoke tests.
 VERBOSE: Final[bool] = _get_bool("COSMOS_VERBOSE", INTERNAL)
 """Whether to enable verbose console output."""
 
+VAE_CPU_OFFLOAD: Final[bool] = _get_bool("COSMOS_VAE_CPU_OFFLOAD", False)
+"""Keep the vision VAE on CPU and move it to GPU only for encode/decode calls.
+
+This saves the VAE's resident GPU memory on memory-constrained single-GPU runs
+at the cost of one host/device round trip per encode or decode call.
+"""
+
 EXPERIMENTAL_CHECKPOINTS: Final[bool] = _get_bool("COSMOS_EXPERIMENTAL_CHECKPOINTS", INTERNAL)
 """Whether to enable experimental checkpoints."""
 

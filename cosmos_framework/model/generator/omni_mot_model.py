@@ -16,18 +16,19 @@ from einops import rearrange
 from torch.distributed._composable.fsdp import FSDPModule
 from torch.nn.modules.module import _IncompatibleKeys
 
-from cosmos_framework.utils.flags import DEVICE, TRAINING, Device
-from cosmos_framework.utils.lazy_config import LazyDict
-from cosmos_framework.utils.lazy_config import instantiate as lazy_instantiate
-from cosmos_framework.model._base import ImaginaireModel
-from cosmos_framework.utils import log, misc
-from cosmos_framework.utils.count_params import count_params
-from cosmos_framework.utils.timer import Timer
-from cosmos_framework.model.generator.algorithm.loss.flow_matching import compute_flow_matching_loss
-from cosmos_framework.model.generator.algorithm.loss.load_balancing import compute_load_balancing_loss
 from cosmos_framework.configs.base.defaults.model_config import OmniMoTModelConfig
 from cosmos_framework.data.generator.action.action_processing import ActionProcessor, get_action_processing_records
+from cosmos_framework.data.generator.sequence_packing import (
+    PackedSequence,
+    SequencePlan,
+    build_sequence_plans_from_data_batch,
+    pack_input_sequence,
+)
+from cosmos_framework.data.generator.sequence_packing.modality import add_special_tokens
 from cosmos_framework.data.generator.utils import IMAGE_RES_SIZE_INFO, VIDEO_RES_SIZE_INFO
+from cosmos_framework.model._base import ImaginaireModel
+from cosmos_framework.model.generator.algorithm.loss.flow_matching import compute_flow_matching_loss
+from cosmos_framework.model.generator.algorithm.loss.load_balancing import compute_load_balancing_loss
 from cosmos_framework.model.generator.diffusion.rectified_flow import RectifiedFlow
 from cosmos_framework.model.generator.diffusion.samplers.edm import EDMSampler
 from cosmos_framework.model.generator.diffusion.samplers.fixed_step import FixedStepSampler
@@ -37,6 +38,8 @@ from cosmos_framework.model.generator.mot.cosmos3_vfm_network import Cosmos3VFMN
 from cosmos_framework.model.generator.mot.modeling_utils import has_noisy_tokens
 from cosmos_framework.model.generator.mot.parallelize_vfm_network import parallelize_vfm_network
 from cosmos_framework.model.generator.reasoner.qwen3_vl.utils import tokenize_caption
+from cosmos_framework.model.generator.tokenizers.interface import VideoTokenizerInterface
+from cosmos_framework.model.generator.upsampler.prompts import build_messages, clean_response
 from cosmos_framework.model.generator.utils.data_and_condition import (
     GenerationDataClean,
     GenerationDataNoised,
@@ -56,19 +59,16 @@ from cosmos_framework.model.generator.utils.moe_utils import (
 from cosmos_framework.model.generator.utils.safetensors_loader import (
     load_language_model as load_language_model_safetensors,
 )
-from cosmos_framework.data.generator.sequence_packing import (
-    PackedSequence,
-    SequencePlan,
-    build_sequence_plans_from_data_batch,
-    pack_input_sequence,
-)
-from cosmos_framework.data.generator.sequence_packing.modality import add_special_tokens
-from cosmos_framework.model.generator.tokenizers.interface import VideoTokenizerInterface
-from cosmos_framework.model.generator.upsampler.prompts import build_messages, clean_response
+from cosmos_framework.utils import log, misc
+from cosmos_framework.utils.count_params import count_params
+from cosmos_framework.utils.flags import DEVICE, TRAINING, VAE_CPU_OFFLOAD, Device
 from cosmos_framework.utils.generator.data_utils import get_vision_data_resolution
 from cosmos_framework.utils.generator.dtensor_helper import DTensorFastEmaModelUpdater
 from cosmos_framework.utils.generator.model_weights_stats import WeightTrainingStat
 from cosmos_framework.utils.generator.parallelism import ParallelDims
+from cosmos_framework.utils.lazy_config import LazyDict
+from cosmos_framework.utils.lazy_config import instantiate as lazy_instantiate
+from cosmos_framework.utils.timer import Timer
 
 
 class OmniMoTModel(ImaginaireModel):
@@ -165,6 +165,11 @@ class OmniMoTModel(ImaginaireModel):
         )
         if hasattr(self.tokenizer_vision_gen, "reset_dtype"):
             self.tokenizer_vision_gen.reset_dtype()
+        if VAE_CPU_OFFLOAD:
+            # Park the frozen VAE on CPU; _vae_on_gpu() moves it over per call.
+            self.tokenizer_vision_gen.model.model.to("cpu")
+            torch.cuda.empty_cache()
+            log.info("VAE_CPU_OFFLOAD: vision VAE parked on CPU (moved to GPU per encode/decode call)")
 
         # 3. Sound/audio tokenizer (optional)
         if self.config.sound_gen:
@@ -179,7 +184,6 @@ class OmniMoTModel(ImaginaireModel):
             log.info(f"Sound tokenizer initialized: {type(self.tokenizer_sound_gen).__name__}")
         else:
             self.tokenizer_sound_gen = None
-
 
     def build_net(self, dtype: torch.dtype, *, lora_enabled: bool | None = None) -> torch.nn.Module:
         # Build model network and parallelize it.
@@ -250,8 +254,16 @@ class OmniMoTModel(ImaginaireModel):
 
         with misc.timer("meta to cuda and broadcast model states"):
             net = net.to(dtype=dtype)
-            net.to_empty(device=DEVICE)
-            if DEVICE == Device.CUDA:
+            if self.config.defer_model_materialization:
+                # The streaming Diffusers loader assigns checkpoint tensors
+                # directly into this meta skeleton. Initializing here is still
+                # required because it materializes non-persistent runtime
+                # buffers (notably RoPE frequencies) on the execution device;
+                # parameter initializers are allocation-free on meta tensors.
+                net.init_weights(buffer_device=DEVICE)
+            else:
+                net.to_empty(device=DEVICE)
+            if DEVICE == Device.CUDA and not self.config.defer_model_materialization:
                 # Weight initialization is not needed for other devices (cpu,
                 # meta), since they are only for checkpoint conversion and smoke
                 # tests.
@@ -4645,13 +4657,29 @@ class OmniMoTModel(ImaginaireModel):
 
         return cleaned_outputs
 
+    @contextmanager
+    def _vae_on_gpu(self):
+        """Temporarily move the vision VAE to GPU when CPU offload is enabled."""
+        if not VAE_CPU_OFFLOAD:
+            yield
+            return
+        vae = self.tokenizer_vision_gen.model.model
+        vae.to("cuda")
+        try:
+            yield
+        finally:
+            vae.to("cpu")
+            torch.cuda.empty_cache()
+
     @torch.no_grad()
     def encode(self, state: torch.Tensor) -> torch.Tensor:
-        return self.tokenizer_vision_gen.encode(state)
+        with self._vae_on_gpu():
+            return self.tokenizer_vision_gen.encode(state)
 
     @torch.no_grad()
     def decode(self, latent: torch.Tensor) -> torch.Tensor:
-        return self.tokenizer_vision_gen.decode(latent)
+        with self._vae_on_gpu():
+            return self.tokenizer_vision_gen.decode(latent)
 
     @torch.no_grad()
     def encode_sound(self, waveform: torch.Tensor) -> torch.Tensor:

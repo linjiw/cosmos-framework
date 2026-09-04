@@ -8,16 +8,18 @@ import attrs
 class QuantizationConfig:
     """Configuration for low-precision quantization of model parameters.
 
-    Controls which quantization method is applied (mxfp8, nvfp4), and which
-    parameters are selected for quantization via include/exclude key filters.
-    When ``method`` is None, quantization is disabled and all other fields are
-    inert.
+    Controls which quantization method is applied (mxfp8, nvfp4, int8wo, int8dq), and
+    which parameters are selected for quantization via include/exclude key
+    filters. When ``method`` is None, quantization is disabled and all other
+    fields are inert. ``mxfp8``/``nvfp4`` need Blackwell tensor cores;
+    ``int8wo`` (weight-only, bf16 compute) and ``int8dq`` (W8A8) run on
+    Ampere and newer.
     """
 
     # Quantization method for the model.
     method: str | None = attrs.field(
         default=None,
-        validator=attrs.validators.optional(attrs.validators.in_({"mxfp8", "nvfp4"})),
+        validator=attrs.validators.optional(attrs.validators.in_({"mxfp8", "nvfp4", "int8wo", "int8dq"})),
     )
 
     # How to select parameters to select for the quantization. Each key is a

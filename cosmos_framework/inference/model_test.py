@@ -12,6 +12,7 @@ import torch.distributed.checkpoint as dcp
 
 from cosmos_framework.configs.base.defaults.compile import CompileConfig
 from cosmos_framework.configs.base.defaults.parallelism import ParallelismConfig
+from cosmos_framework.configs.base.defaults.quantization import QuantizationConfig
 from cosmos_framework.inference.args import _CHECKPOINTS, DEFAULT_CHECKPOINT
 from cosmos_framework.inference.common.args import CheckpointType
 from cosmos_framework.inference.common.config import structure_config
@@ -23,6 +24,7 @@ from cosmos_framework.inference.model import (
     _DiffusersLoadPlanner,
     _is_diffusers_checkpoint,
     _normalize_diffusers_target_key,
+    _StreamingDiffusersLoadPlanner,
 )
 
 
@@ -144,6 +146,45 @@ def test_diffusers_dcp_load_remaps_nested_safetensors(tmp_path: Path):
     )
 
     torch.testing.assert_close(target["model.net._orig_mod.vae2llm.weight"], source)
+
+
+def test_diffusers_streaming_load_quantizes_cpu_weight_into_meta_model(tmp_path: Path) -> None:
+    shard_rel_path = "transformer/diffusion_pytorch_model.safetensors"
+    shard_path = tmp_path / shard_rel_path
+    shard_path.parent.mkdir(parents=True)
+
+    source = torch.arange(24, dtype=torch.bfloat16).reshape(4, 6)
+    safetensors.torch.save_file({"proj_in.weight": source}, shard_path)
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"metadata": {}, "weight_map": {"proj_in.weight": shard_rel_path}}),
+        encoding="utf-8",
+    )
+
+    model = torch.nn.Module()
+    model.vae2llm = torch.nn.Linear(6, 4, bias=False, device="meta", dtype=torch.bfloat16)
+    model.action2llm = torch.nn.Linear(2, 2, bias=False, device="meta", dtype=torch.bfloat16)
+    target = {
+        "model.net.vae2llm.weight": model.vae2llm.weight,
+        "model.net.action2llm.weight": model.action2llm.weight,
+    }
+    dcp.load(
+        state_dict=target,
+        storage_reader=_DiffusersHuggingFaceStorageReader(tmp_path),
+        planner=_StreamingDiffusersLoadPlanner(
+            tmp_path,
+            model=model,
+            quantization_config=QuantizationConfig(method="int8wo", include_regex=[]),
+            device="cpu",
+        ),
+    )
+
+    assert model.vae2llm.weight.device.type == "cpu"
+    assert type(model.vae2llm.weight).__name__ == "Int8Tensor"
+    assert model.vae2llm.weight.qdata.dtype == torch.int8
+    assert model.action2llm.weight.device.type == "cpu"
+    actual = model.vae2llm(torch.ones(1, 6, dtype=torch.bfloat16))
+    expected = torch.nn.functional.linear(torch.ones(1, 6, dtype=torch.bfloat16), source)
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.2)
 
 
 def test_diffusers_weight_map_registered_checkpoint():
