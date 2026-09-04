@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="A local research showcase for low-memory Cosmos3-Edge inference with streamed INT8 loading."
+    />
+    <title>Cosmos3-Edge · INT8 Research</title>
+    <link rel="stylesheet" href="styles.css" />
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <div class="ambient ambient-one" aria-hidden="true"></div>
+    <div class="ambient ambient-two" aria-hidden="true"></div>
+
+    <header class="site-header">
+      <a class="brand" href="#overview" aria-label="Cosmos3 Edge research home">
+        <svg class="brand-mark" viewBox="0 0 40 40" aria-hidden="true">
+          <circle cx="20" cy="20" r="15.5"></circle>
+          <path d="M8 20h24M20 8c5 5 7.5 9 7.5 12S25 27 20 32c-5-5-7.5-9-7.5-12S15 13 20 8Z"></path>
+        </svg>
+        <span>Cosmos3<span class="brand-accent">/edge-lab</span></span>
+      </a>
+      <nav aria-label="Primary navigation">
+        <a href="#results">Results</a>
+        <a href="#system">System</a>
+        <a href="#demos">Demos</a>
+        <a href="#quality">Quality</a>
+      </nav>
+      <a class="header-cta" href="#reproduce">Run locally <span aria-hidden="true">↘</span></a>
+    </header>
+
+    <main id="main">
+      <section class="hero section-shell" id="overview">
+        <div class="hero-copy reveal">
+          <div class="eyebrow"><span class="pulse-dot"></span> Independent optimization study · 2026</div>
+          <h1>Cosmos3-Edge,<br /><span>without the memory wall.</span></h1>
+          <p class="hero-lede">
+            Stream each checkpoint tensor, quantize it on CPU, and move only its compact INT8
+            representation to CUDA. The result is practical world-model inference on a 16&nbsp;GB consumer GPU.
+          </p>
+          <div class="hero-actions">
+            <a class="button button-primary" href="#demos">Explore the outputs</a>
+            <a class="button button-secondary" href="#system">See how it works</a>
+          </div>
+          <dl class="hero-facts" aria-label="Test configuration">
+            <div><dt>Hardware</dt><dd>RTX 5080 · 16 GB</dd></div>
+            <div><dt>Model</dt><dd>Cosmos3-Edge · 2B</dd></div>
+            <div><dt>Stack</dt><dd>PyTorch 2.10 · CUDA 13</dd></div>
+          </dl>
+        </div>
+
+        <div class="hero-visual reveal reveal-delay">
+          <div class="visual-frame">
+            <div class="frame-toolbar">
+              <span><i></i><i></i><i></i></span>
+              <span class="mono">t2i / int8wo / seed_0</span>
+              <span class="live-chip">LIVE OUTPUT</span>
+            </div>
+            <img
+              src="assets/t2i-int8wo-seed0.jpg"
+              alt="INT8 weight-only Cosmos3-Edge output showing a robot arm in a bright laboratory"
+              width="640"
+              height="640"
+            />
+            <div class="visual-overlay">
+              <span>streamed INT8WO</span>
+              <strong>7.20 GiB</strong>
+              <small>peak process VRAM</small>
+            </div>
+          </div>
+          <div class="orbit-card orbit-top"><span>−26.6%</span> memory</div>
+          <div class="orbit-card orbit-bottom"><span>35</span> UniPC steps</div>
+        </div>
+      </section>
+
+      <div class="signal-strip" aria-label="Optimization highlights">
+        <span>STREAMED SAFETENSORS</span><i></i><span>CPU-SIDE QUANTIZATION</span><i></i>
+        <span>VAE CPU OFFLOAD</span><i></i><span>TORCH COMPILE</span><i></i><span>REPRODUCIBLE SEEDS</span>
+      </div>
+
+      <section class="section-shell results-section" id="results">
+        <div class="section-heading reveal">
+          <div><span class="section-index">01</span><span class="eyebrow">Measured performance</span></div>
+          <h2>Smaller footprint.<br />Faster candidate.</h2>
+          <p>
+            Same prompt, seed, sampler, resolution, and 35-step schedule. Latency excludes model loading and the
+            single compilation warmup.
+          </p>
+        </div>
+
+        <div class="results-grid reveal">
+          <div class="chart-card">
+            <div class="chart-header">
+              <div>
+                <span class="chart-kicker">T2I · 480p · seed 0</span>
+                <h3 id="chart-title">Peak GPU memory</h3>
+              </div>
+              <div class="segmented-control" role="group" aria-label="Chart metric">
+                <button class="is-active" type="button" data-metric="memory">Memory</button>
+                <button type="button" data-metric="latency">Latency</button>
+              </div>
+            </div>
+            <div class="bar-chart" id="performance-chart" aria-describedby="chart-note">
+              <div class="bar-row" data-mode="BF16" data-memory="10048" data-latency="5.603">
+                <div class="bar-label"><span>BF16</span><small>compiled baseline</small></div>
+                <div class="bar-track"><span class="bar-fill bar-bf16"></span></div>
+                <output>10,048 MiB</output>
+              </div>
+              <div class="bar-row" data-mode="INT8WO" data-memory="7374" data-latency="6.093">
+                <div class="bar-label"><span>INT8WO</span><small>recommended</small></div>
+                <div class="bar-track"><span class="bar-fill bar-wo"></span></div>
+                <output>7,374 MiB</output>
+              </div>
+              <div class="bar-row" data-mode="INT8DQ" data-memory="7358" data-latency="4.180">
+                <div class="bar-label"><span>INT8DQ</span><small>quality candidate</small></div>
+                <div class="bar-track"><span class="bar-fill bar-dq"></span></div>
+                <output>7,358 MiB</output>
+              </div>
+            </div>
+            <p class="chart-note" id="chart-note">Process VRAM sampled every 100 ms. Lower is better.</p>
+          </div>
+
+          <aside class="result-callout">
+            <span class="callout-label">INT8DQ vs compiled BF16</span>
+            <strong>25.4<span>%</span></strong>
+            <h3>lower batch latency</h3>
+            <div class="callout-rule"></div>
+            <dl>
+              <div><dt>Memory saved</dt><dd>2,690 MiB</dd></div>
+              <div><dt>Peak footprint</dt><dd>7,358 MiB</dd></div>
+              <div><dt>Status</dt><dd><span class="status-dot"></span> Research candidate</dd></div>
+            </dl>
+          </aside>
+        </div>
+
+        <div class="metric-cards reveal">
+          <article><span>01 / memory</span><strong>−26.8%</strong><p>INT8DQ peak reduction against compiled BF16.</p></article>
+          <article><span>02 / latency</span><strong>−31.4%</strong><p>INT8DQ batch latency against compiled INT8WO.</p></article>
+          <article><span>03 / i2v</span><strong>6,456 MiB</strong><p>25-frame optimized I2V peak at 256p.</p></article>
+        </div>
+      </section>
+
+      <section class="system-section" id="system">
+        <div class="section-shell">
+          <div class="section-heading light reveal">
+            <div><span class="section-index">02</span><span class="eyebrow">System design</span></div>
+            <h2>Never hold the<br />full BF16 model.</h2>
+            <p>
+              A custom Diffusers planner keeps checkpoint-backed parameters on the meta device and materializes
+              one tensor at a time.
+            </p>
+          </div>
+
+          <div class="pipeline reveal" aria-label="Streaming checkpoint loading pipeline">
+            <article class="pipeline-step">
+              <span class="step-number">01</span>
+              <div class="step-icon database-icon" aria-hidden="true"></div>
+              <h3>Read on CPU</h3>
+              <p>Open one safetensors view while the target model remains on <code>meta</code>.</p>
+              <small>BF16 source tensor</small>
+            </article>
+            <div class="pipeline-arrow" aria-hidden="true"><span></span></div>
+            <article class="pipeline-step accent-step">
+              <span class="step-number">02</span>
+              <div class="step-icon quant-icon" aria-hidden="true">8</div>
+              <h3>Quantize in flight</h3>
+              <p>Convert selected Linear weights to INT8 before any CUDA allocation.</p>
+              <small>Per-channel weight scale</small>
+            </article>
+            <div class="pipeline-arrow" aria-hidden="true"><span></span></div>
+            <article class="pipeline-step">
+              <span class="step-number">03</span>
+              <div class="step-icon gpu-icon" aria-hidden="true"><i></i></div>
+              <h3>Move compact</h3>
+              <p>Materialize only the compact tensor subclass on the execution device.</p>
+              <small>No full CUDA BF16 copy</small>
+            </article>
+          </div>
+
+          <div class="system-notes reveal">
+            <article>
+              <span class="note-icon">↕</span>
+              <div><h3>VAE parking</h3><p>The vision VAE rests on CPU between encode and decode calls, returning to CUDA only when needed.</p></div>
+            </article>
+            <article>
+              <span class="note-icon">◎</span>
+              <div><h3>Two INT8 paths</h3><p>INT8WO keeps BF16 activations. INT8DQ dynamically quantizes activations for W8A8 execution.</p></div>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="section-shell demos-section" id="demos">
+        <div class="section-heading reveal">
+          <div><span class="section-index">03</span><span class="eyebrow">Generated evidence</span></div>
+          <h2>One model.<br />Two physical-AI tasks.</h2>
+          <p>Real outputs generated locally from the repository’s standard robotics examples.</p>
+        </div>
+
+        <div class="demo-tabs reveal" role="tablist" aria-label="Demo modality">
+          <button id="tab-t2i" class="is-active" type="button" role="tab" aria-selected="true" aria-controls="panel-t2i" data-demo="t2i">Text → image</button>
+          <button id="tab-i2v" type="button" role="tab" aria-selected="false" aria-controls="panel-i2v" data-demo="i2v">Image → video</button>
+        </div>
+
+        <div class="demo-panel is-active reveal" id="panel-t2i" role="tabpanel" aria-labelledby="tab-t2i">
+          <div class="demo-stage">
+            <img id="t2i-image" src="assets/t2i-int8wo-seed0.jpg" alt="INT8WO robotics laboratory generation" width="640" height="640" />
+            <div class="demo-badge"><span id="t2i-mode">INT8WO</span><small>seed 0 · 640 × 640</small></div>
+          </div>
+          <div class="demo-sidebar">
+            <span class="chart-kicker">Paired output viewer</span>
+            <h3>Robotics laboratory</h3>
+            <p class="prompt-text">“A modern robotics research laboratory… a metallic robotic arm mounted on a clean white workbench…”</p>
+            <div class="output-picker" role="group" aria-label="T2I precision mode">
+              <button type="button" data-output="bf16" data-src="assets/t2i-bf16-seed0.jpg">BF16 <small>baseline</small></button>
+              <button class="is-active" type="button" data-output="int8wo" data-src="assets/t2i-int8wo-seed0.jpg">INT8WO <small>recommended</small></button>
+              <button type="button" data-output="int8dq" data-src="assets/t2i-int8dq-seed0.jpg">INT8DQ <small>candidate</small></button>
+            </div>
+            <dl class="demo-config">
+              <div><dt>Sampler</dt><dd>UniPC</dd></div><div><dt>Steps</dt><dd>35</dd></div>
+              <div><dt>Resolution</dt><dd>480p bucket</dd></div><div><dt>Compile</dt><dd>Enabled</dd></div>
+            </dl>
+          </div>
+        </div>
+
+        <div class="demo-panel" id="panel-i2v" role="tabpanel" aria-labelledby="tab-i2v" hidden>
+          <div class="video-stage">
+            <video controls muted loop playsinline poster="assets/i2v-int8wo-seed0-strip.jpg" preload="metadata">
+              <source src="assets/i2v-int8wo-seed0.mp4" type="video/mp4" />
+              Your browser does not support embedded MP4 video.
+            </video>
+            <div class="demo-badge"><span>INT8WO</span><small>seed 0 · 25 frames</small></div>
+          </div>
+          <div class="demo-sidebar">
+            <span class="chart-kicker">Optimized video output</span>
+            <h3>Robotic manipulation</h3>
+            <p class="prompt-text">“The right robotic hand extends toward the red spherical object, grasps it, and moves it while the left hand remains still.”</p>
+            <div class="video-stats">
+              <div><strong>6.31</strong><span>GiB peak</span></div>
+              <div><strong>18.62</strong><span>seconds</span></div>
+              <div><strong>24</strong><span>FPS</span></div>
+            </div>
+            <p class="demo-note">Generated at the documented 25-frame minimum to provide a lightweight, reproducible local demo.</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="quality-section" id="quality">
+        <div class="section-shell quality-grid">
+          <div class="section-heading light reveal">
+            <div><span class="section-index">04</span><span class="eyebrow">Quality gate</span></div>
+            <h2>Speed earns a trial.<br />Quality earns promotion.</h2>
+            <p>
+              INT8DQ is faster, but remains a candidate until paired T2I and I2V outputs across seeds 0–3 clear
+              prompt-alignment, conditioning, and temporal-stability checks.
+            </p>
+            <div class="recommendation"><span class="status-dot"></span><div><small>Current recommendation</small><strong>Ship INT8WO by default</strong></div></div>
+          </div>
+
+          <div class="quality-card reveal">
+            <div class="quality-card-header">
+              <div><span>Seed-0 T2I pilot</span><h3>CLIP prompt alignment</h3></div>
+              <span class="pilot-chip">pilot · n=1</span>
+            </div>
+            <div class="quality-bars">
+              <div><span>BF16</span><i><b style="--score: 91.6%"></b></i><strong>0.3662</strong></div>
+              <div><span>INT8WO</span><i><b class="wo" style="--score: 95.4%"></b></i><strong>0.3817</strong></div>
+              <div><span>INT8DQ</span><i><b class="dq" style="--score: 91.6%"></b></i><strong>0.3664</strong></div>
+            </div>
+            <p>
+              The pilot does not establish a winner. It shows why pixel similarity alone cannot judge a stochastic
+              output: every mode produced a valid but compositionally different image.
+            </p>
+            <div class="gate-list">
+              <div class="is-ready"><span>✓</span><p><strong>Harness</strong> CLIP + LPIPS + SSIM + PSNR</p></div>
+              <div class="is-ready"><span>✓</span><p><strong>I2V signals</strong> conditioning + optical flow</p></div>
+              <div class="is-pending"><span>→</span><p><strong>Next</strong> complete paired seeds 0–3</p></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section-shell reproduce-section" id="reproduce">
+        <div class="section-heading reveal">
+          <div><span class="section-index">05</span><span class="eyebrow">Reproduce locally</span></div>
+          <h2>Run the same path.</h2>
+          <p>No web framework and no hosted services. Serve this page or reproduce the inference directly from the repository.</p>
+        </div>
+
+        <div class="code-grid reveal">
+          <article class="code-card">
+            <div class="code-title"><span>Optimized T2I</span><button class="copy-button" type="button" data-copy="code-t2i">Copy</button></div>
+            <pre><code id="code-t2i">COSMOS_VAE_CPU_OFFLOAD=1 LD_LIBRARY_PATH='' \
+python -m cosmos_framework.scripts.inference \
+  --parallelism-preset=latency \
+  -i inputs/omni/t2i.json \
+  -o outputs/edge_int8wo \
+  --checkpoint-path=Cosmos3-Edge \
+  --quantization-method=int8wo \
+  --use-torch-compile --no-guardrails --seed=0</code></pre>
+          </article>
+          <article class="code-card">
+            <div class="code-title"><span>Four-seed quality gate</span><button class="copy-button" type="button" data-copy="code-eval">Copy</button></div>
+            <pre><code id="code-eval"># BF16, INT8WO, and INT8DQ
+# T2I + 25-frame I2V, seeds 0–3
+./tools/run_edge_int8_quality_eval.sh
+
+# Results
+cat outputs/edge_int8_quality/metrics.json</code></pre>
+          </article>
+        </div>
+
+        <div class="serve-card reveal">
+          <div><span class="serve-icon">›_</span><div><small>Open this showcase</small><strong>python -m http.server 4173 --directory showcase</strong></div></div>
+          <button class="copy-button copy-light" type="button" data-copy-text="python -m http.server 4173 --directory showcase">Copy command</button>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <div class="footer-brand"><span class="pulse-dot"></span> Cosmos3-Edge local research build</div>
+      <p>Measured, generated, and documented on an NVIDIA GeForce RTX 5080.</p>
+      <div class="commit-list"><span>26ccec8 · implementation</span><span>4a54c0a · results</span><span>2d95a83 · quality gate</span></div>
+    </footer>
+
+    <div class="toast" role="status" aria-live="polite">Copied to clipboard</div>
+  </body>
+</html>

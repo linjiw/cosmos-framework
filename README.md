@@ -29,6 +29,7 @@
 - [Training (Supervised Fine-Tuning)](./docs/training.md)
   - [JSONL Dataset](./docs/dataset_jsonl.md)
 - [Inference](./docs/inference.md)
+- [Local INT8 Research Showcase](./showcase/README.md)
 - [Policy Server](./docs/action_policy_droid_server.md)
 - [Agent Skills](#agent-skills)
 - Reference
@@ -120,6 +121,10 @@ and seed 0 with the repository's existing [`t2i`](./inputs/omni/t2i.json) and
 
 The I2V run peaked at 6,456 MiB and completed in 18.62 seconds; select its frame
 strip to open the generated MP4.
+
+For an interactive local presentation of the architecture, benchmarks, paired
+T2I outputs, and playable I2V result, see the
+[INT8 research showcase](./showcase/README.md).
 
 ## Policy Server
 
