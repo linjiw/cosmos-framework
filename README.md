@@ -84,6 +84,40 @@ python -m cosmos_framework.scripts.inference \
     --seed=0
 ```
 
+### Low-memory Cosmos3-Edge inference
+
+This optimization adds streamed INT8 checkpoint loading and optional vision-VAE CPU
+offload so Cosmos3-Edge can run on memory-constrained GPUs without first
+materializing the complete BF16 model on CUDA. `int8wo` keeps BF16 activations;
+`int8dq` also dynamically quantizes activations for W8A8 tensor-core execution.
+See the [inference guide](./docs/inference.md#cosmos3-edge) for the command.
+
+Measured on one GeForce RTX 5080 (16,303 MiB), using the repository `t2i`
+example at 480p, seed 0, 35 UniPC steps, VAE CPU offload, and one compile warmup:
+
+| Weight path | Peak GPU memory | Batch latency | Versus compiled BF16 |
+| ----------- | --------------: | ------------: | -------------------- |
+| BF16 + compile | 10,048 MiB | 5.60 s | baseline |
+| INT8WO + compile | 7,374 MiB | 6.09 s | 26.6% less memory; 8.7% slower |
+| INT8DQ + compile | 7,358 MiB | 4.18 s | 26.8% less memory; 25.4% faster |
+
+INT8WO remains the conservative recommendation while INT8DQ undergoes a
+multi-seed T2I/I2V quality evaluation. Peak memory is process VRAM sampled at
+100 ms; latency excludes model loading and compilation warmup.
+
+#### Optimized example outputs
+
+The outputs below use streamed INT8WO loading, VAE CPU offload, torch compile,
+and seed 0 with the repository's existing [`t2i`](./inputs/omni/t2i.json) and
+[`i2v`](./inputs/omni/i2v.json) prompts.
+
+| Text-to-image (480p, 35 steps) | Image-to-video (256p, 25 frames, 35 steps) |
+| ------------------------------ | ------------------------------------------ |
+| ![INT8WO text-to-image result: a robotic arm in a bright laboratory](./docs/assets/cosmos3-edge-int8/t2i-int8wo-seed0.jpg) | [![INT8WO image-to-video frame strip showing a robotic arm reaching toward a red ball](./docs/assets/cosmos3-edge-int8/i2v-int8wo-seed0-strip.jpg)](./docs/assets/cosmos3-edge-int8/i2v-int8wo-seed0.mp4) |
+
+The I2V run peaked at 6,456 MiB and completed in 18.62 seconds; select its frame
+strip to open the generated MP4.
+
 ## Policy Server
 
 See [Policy Server](./docs/action_policy_droid_server.md) for the full guide.
