@@ -103,7 +103,10 @@ example at 480p, seed 0, 35 UniPC steps, VAE CPU offload, and one compile warmup
 
 INT8WO remains the conservative recommendation while INT8DQ undergoes a
 multi-seed T2I/I2V quality evaluation. Peak memory is process VRAM sampled at
-100 ms; latency excludes model loading and compilation warmup.
+100 ms; latency excludes model loading and compilation warmup. The reproducible
+four-seed runner and paired metric gate live in
+[`tools/run_edge_int8_quality_eval.sh`](./tools/run_edge_int8_quality_eval.sh)
+and [`tools/edge_int8_quality_eval.py`](./tools/edge_int8_quality_eval.py).
 
 #### Optimized example outputs
 
